@@ -5,7 +5,8 @@ As a part of the Infinite Hacker at Devcon Bangkok our team of 4 Blockchain at B
 
 # Intended WorkFlow
 
- sequenceDiagram
+```mermaid
+sequenceDiagram
     participant Event_Source
     participant AVS_Contract
     participant Operator
@@ -31,5 +32,4 @@ As a part of the Infinite Hacker at Devcon Bangkok our team of 4 Blockchain at B
         end
         AVS_Contract ->> AVS_Contract: Remove task from queue
     end
-
 
