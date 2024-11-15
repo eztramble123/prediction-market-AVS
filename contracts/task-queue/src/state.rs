@@ -2,12 +2,10 @@ use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Coin, Deps, Env, MessageInfo, StdError};
 use cw_storage_plus::{Index, IndexList, IndexedMap, Item, MultiIndex};
 use cw_utils::must_pay;
-
 use lavs_apis::id::TaskId;
-use lavs_apis::tasks::{Requestor, Status, TimeoutConfig};
-
+use lavs_apis::tasks::{Requestor, Status, TimeoutConfig, ResponseType};
 use crate::error::ContractError;
-use crate::msg::{self, InstantiateMsg, RequestType, ResponseType};
+use crate::msg::{self, InstantiateMsg, RequestType};
 
 pub const CONFIG: Item<Config> = Item::new("config");
 
@@ -24,7 +22,7 @@ impl<'a> IndexList<Task> for TaskIndexes<'a> {
 pub const TASKS: IndexedMap<TaskId, Task, TaskIndexes<'static>> = IndexedMap::new(
     "tasks",
     TaskIndexes {
-        status: MultiIndex::new(|_, d: &Task| d.status.as_str(), "tasks", "tasks__status"),
+        status: MultiIndex::new(|_, d: &Task| d.status.as_str(), "tasks", "tasks_status"),
     },
 );
 
@@ -33,7 +31,7 @@ pub struct Config {
     pub next_id: TaskId,
     pub requestor: RequestorConfig,
     pub timeout: TimeoutConfig,
-    pub verifier: Addr,
+    pub verifier: Addr, // Address of the Oracle Verifier contract
 }
 
 impl Config {
@@ -41,6 +39,7 @@ impl Config {
         let requestor = RequestorConfig::validate(deps, input.requestor)?;
         let timeout = validate_timeout_info(input.timeout)?;
         let verifier = deps.api.addr_validate(&input.verifier)?;
+
         Ok(Config {
             next_id: TaskId::new(1),
             requestor,
@@ -100,9 +99,11 @@ pub fn validate_timeout_info(input: msg::TimeoutInfo) -> Result<TimeoutConfig, C
     let default = input.default;
     let minimum = input.minimum.unwrap_or(default);
     let maximum = input.maximum.unwrap_or(default);
+
     if default < minimum || default > maximum || minimum > maximum {
         return Err(ContractError::InvalidTimeoutInfo);
     }
+
     Ok(TimeoutConfig {
         default,
         minimum,
@@ -125,7 +126,7 @@ pub struct Task {
     pub status: Status,
     pub timing: Timing,
     pub payload: RequestType,
-    pub result: Option<ResponseType>,
+    pub result: Option<ResponseType>, // Stores the result from Oracle Verifier
 }
 
 impl Task {
@@ -169,7 +170,8 @@ impl Task {
             Status::Open {} | Status::Expired {} => return Err(ContractError::TaskExpired),
             Status::Completed { .. } => return Err(ContractError::TaskCompleted),
         };
-        self.status = Status::completed(env);
+
+        self.status = Status::Completed { result: result.clone() };
         self.result = Some(result);
         Ok(())
     }
@@ -181,6 +183,7 @@ impl Task {
             Status::Expired {} => return Err(ContractError::TaskExpired),
             Status::Completed { .. } => return Err(ContractError::TaskCompleted),
         };
+
         self.status = Status::Expired {};
         Ok(())
     }

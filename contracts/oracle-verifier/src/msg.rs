@@ -1,66 +1,52 @@
-use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Decimal};
-use cw_orch::ExecuteFns;
-use lavs_apis::{
-    id::TaskId,
-    verifier_simple::{OperatorVoteInfoResponse, TaskInfoResponse},
-};
-
-use crate::state::Config;
+use cosmwasm_schema::cw_serde;
+use lavs_apis::interfaces::tasks::TaskId;
+use lavs_apis::interfaces::voting::VotingPower;
+use cosmwasm_std::Decimal;
 
 #[cw_serde]
 pub struct InstantiateMsg {
-    // The address of the operator contract
-    pub operator_contract: String,
-    // What percent of the operators must submit their vote
-    pub threshold_percentage: Decimal,
-    // Maximum allowed difference between the votes of operatos
+    pub threshold_percent: Decimal,
     pub allowed_spread: Decimal,
-    // Differance bigger than `slashable_spread` would slash the operators
     pub slashable_spread: Decimal,
-    /// The percentage of voting power needed to agree in order to complete a task
-    pub required_percentage: u32,
+    pub operator_contract: String, // Address of the Mock Operators contract
 }
 
 #[cw_serde]
-#[derive(ExecuteFns)]
+#[derive(cw_orch::ExecuteFns)]
 #[cw_orch(disable_fields_sorting)]
 pub enum ExecuteMsg {
-    ExecutedTask {
-        /// Task queue contract for which we completed the task
-        task_queue_contract: String,
-        /// The ID of the task that was completed
+    /// Allows the Oracle Verifier to process votes for a specific task
+    ProcessVotes {
         task_id: TaskId,
-        /// The result of the task, (JSON) serialized as a string
-        /// It is serialized to allow for easy comparison and to avoid field sorting issues when verifying signatures
-        result: String,
+    },
+    /// Slash operators who have deviated from the consensus
+    SlashOperators {
+        task_id: TaskId,
+    },
+    /// Receives a vote from an operator
+    SubmitVote {
+        task_id: TaskId,
+        operator: String,
+        result: Decimal,
     },
 }
 
 #[cw_serde]
-#[derive(cw_orch::QueryFns)]
-#[cw_orch(disable_fields_sorting)]
-#[derive(QueryResponses)]
 pub enum QueryMsg {
-    #[returns(Config)]
-    Config {},
-    /// Ordered by completion time descending (last completed first)
-    #[returns(Option<TaskInfoResponse>)]
+    /// Query voting power of an operator at a specific height
+    VotingPowerAtHeight {
+        address: String,
+        height: Option<u64>,
+    },
+    /// Query total voting power at a specific height
+    TotalPowerAtHeight {
+        height: Option<u64>,
+    },
+    /// Query all voters
+    AllVoters {},
+    /// Query task information
     TaskInfo {
-        /// The task contract we are interested in
         task_contract: String,
-        /// The ID of the task we are interested in
         task_id: TaskId,
     },
-    #[returns(Option<OperatorVoteInfoResponse>)]
-    OperatorVote {
-        /// The task contract we are interested in
-        task_contract: String,
-        /// The ID of the task we are interested in
-        task_id: TaskId,
-        /// The operator whose vote we are interested in
-        operator: String,
-    },
-    #[returns(Vec<Addr>)]
-    SlashableOperators {},
 }

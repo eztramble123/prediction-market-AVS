@@ -1,33 +1,31 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response};
+use cosmwasm_std::{
+    to_binary, Addr, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, Uint128, Decimal,
+    CosmosMsg, WasmMsg, Order, OrderBy,
+};
 use cw2::set_contract_version;
-
-use lavs_apis::interfaces::tasks as interface;
-use lavs_apis::tasks::{CustomExecuteMsg, CustomQueryMsg, TaskQueryMsg};
-
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::msg::{RequestType, ResponseType, Status};
-use crate::state::{Config, Task, CONFIG, TASKS};
+use crate::state::{Config, Task, TASKS, CONFIG};
+use lavs_apis::tasks::{ListOpenResponse, TaskMetadata};
+use serde::Deserialize;
 
 // version info for migration info
-const CONTRACT_NAME: &str = env!("CARGO_PKG_NAME");
-const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CONTRACT_NAME: &str = "crates.io:task-queue";
+const CONTRACT_VERSION: &str = "1.0.0";
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
     deps: DepsMut,
-    _env: Env,
-    _info: MessageInfo,
+    env: Env,
+    info: MessageInfo,
     msg: InstantiateMsg,
 ) -> Result<Response, ContractError> {
-    let config = Config::validate(deps.as_ref(), msg)?;
-    CONFIG.save(deps.storage, &config)?;
-
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-
-    Ok(Response::default())
+    let config = Config::validate(deps, msg)?;
+    CONFIG.save(deps.storage, &config)?;
+    Ok(Response::new().add_attribute("action", "instantiate"))
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -38,40 +36,23 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
-        ExecuteMsg::Api(api) => match api {
-            interface::TaskExecuteMsg::Complete { task_id, response } => {
-                execute::complete(deps, env, info, task_id, response)
-            }
-        },
-        ExecuteMsg::Custom(custom) => match custom {
-            CustomExecuteMsg::Create {
-                description,
-                timeout,
-                payload,
-            } => execute::create(deps, env, info, description, timeout, payload),
-            CustomExecuteMsg::Timeout { task_id } => execute::timeout(deps, env, info, task_id),
-        },
+        ExecuteMsg::Create {
+            description,
+            timeout,
+            payload,
+            options,
+            proposed_winner,
+        } => execute::create_task(deps, env, info, description, timeout, payload, options, proposed_winner),
+        ExecuteMsg::CompleteTask { task_id, result } => execute::complete_task(deps, env, info, task_id, result),
+        ExecuteMsg::ExpireTask { task_id } => execute::expire_task(deps, env, info, task_id),
     }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> Result<Binary, ContractError> {
+pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::Api(api) => match api {
-            TaskQueryMsg::TaskStatus { id } => {
-                Ok(to_json_binary(&query::task_status(deps, env, id)?)?)
-            }
-        },
-        QueryMsg::Custom(custom) => match custom {
-            CustomQueryMsg::Task { id } => Ok(to_json_binary(&query::task(deps, env, id)?)?),
-            CustomQueryMsg::ListOpen { start_after, limit } => Ok(to_json_binary(
-                &query::list_open(deps, env, start_after, limit)?,
-            )?),
-            CustomQueryMsg::ListCompleted { start_after, limit } => Ok(to_json_binary(
-                &query::list_completed(deps, env, start_after, limit)?,
-            )?),
-            CustomQueryMsg::Config {} => Ok(to_json_binary(&query::config(deps, env)?)?),
-        },
+        QueryMsg::ListOpen { start_after, limit } => to_binary(&query::list_open(deps, env, start_after, limit)?),
+        QueryMsg::TaskInfo { task_id } => to_binary(&query::task_info(deps, env, task_id)?),
     }
 }
 
@@ -80,224 +61,387 @@ mod execute {
     use lavs_apis::id::TaskId;
 
     use crate::state::{check_timeout, Timing};
+    use crate::msg::CreateTaskMsg;
 
     use super::*;
 
-    pub fn create(
+    pub fn create_task(
         deps: DepsMut,
         env: Env,
         info: MessageInfo,
         description: String,
         timeout: Option<u64>,
         payload: RequestType,
+        options: Vec<String>,
+        proposed_winner: String,
     ) -> Result<Response, ContractError> {
+        nonpayable(&info)?;
         let mut config = CONFIG.load(deps.storage)?;
         let timeout = check_timeout(&config.timeout, timeout)?;
         config.requestor.check_requestor(&info)?;
+        let task_id = TaskId::new(deps.storage);
 
-        let timing = Timing::new(&env, timeout);
-        let status = Status::new();
-        let task = Task {
+        let task = Task::new(
             description,
-            status,
-            timing,
+            timeout,
             payload,
-            result: None,
-        };
-        let task_id = config.next_id;
-        TASKS.save(deps.storage, task_id, &task)?;
-        config.next_id = TaskId::new(task_id.u64() + 1);
-        CONFIG.save(deps.storage, &config)?;
+            options,
+            proposed_winner,
+        );
 
-        let res = Response::new()
-            .add_attribute("action", "create")
-            .add_attribute("task_id", task_id.to_string());
-        Ok(res)
+        TASKS.save(deps.storage, task_id.clone(), &task)?;
+
+        Ok(Response::new()
+            .add_attribute("action", "create_task")
+            .add_attribute("task_id", task_id.to_string()))
     }
 
-    pub fn complete(
+    pub fn complete_task(
         deps: DepsMut,
         env: Env,
         info: MessageInfo,
         task_id: TaskId,
-        response: ResponseType,
+        result: ResponseType,
     ) -> Result<Response, ContractError> {
-        nonpayable(&info)?;
-
         let config = CONFIG.load(deps.storage)?;
+
+        // Ensure that only the Oracle Verifier can complete tasks
         if info.sender != config.verifier {
-            return Err(ContractError::Unauthorized {});
+            return Err(ContractError::Unauthorized);
         }
 
-        // ensures it is open and not expired, then store response
-        let mut task = TASKS.load(deps.storage, task_id)?;
-        task.complete(&env, response)?;
-        TASKS.save(deps.storage, task_id, &task)?;
+        TASKS.update(deps.storage, task_id.clone(), |mut task| -> Result<_, ContractError> {
+            task.complete(&env, result)?;
+            Ok(task)
+        })?;
 
-        let res = Response::new()
-            .add_attribute("action", "completed")
-            .add_attribute("task_id", task_id.to_string());
-        Ok(res)
+        Ok(Response::new()
+            .add_attribute("action", "complete_task")
+            .add_attribute("task_id", task_id.to_string())
+            .add_attribute("result", "verified"))
     }
 
-    pub fn timeout(
+    pub fn expire_task(
         deps: DepsMut,
         env: Env,
         info: MessageInfo,
         task_id: TaskId,
     ) -> Result<Response, ContractError> {
-        nonpayable(&info)?;
+        let config = CONFIG.load(deps.storage)?;
 
-        // ensures it is open and expired
-        let mut task = TASKS.load(deps.storage, task_id)?;
-        task.expire(&env)?;
-        TASKS.save(deps.storage, task_id, &task)?;
+        // Only requestor can expire tasks
+        config.requestor.check_requestor(&info)?;
 
-        let res = Response::new()
-            .add_attribute("action", "expired")
-            .add_attribute("task_id", task_id.to_string());
-        Ok(res)
+        TASKS.update(deps.storage, task_id.clone(), |mut task| -> Result<_, ContractError> {
+            task.expire(&env)?;
+            Ok(task)
+        })?;
+
+        Ok(Response::new()
+            .add_attribute("action", "expire_task")
+            .add_attribute("task_id", task_id.to_string()))
     }
 }
 
 mod query {
-    use cw_storage_plus::Bound;
-    use lavs_apis::{id::TaskId, tasks::ConfigResponse};
-
-    use crate::msg::{
-        CompletedTaskOverview, ListCompletedResponse, ListOpenResponse, OpenTaskOverview,
-        TaskResponse, TaskStatusResponse,
-    };
-
     use super::*;
+    use cosmwasm_std::Order;
 
-    pub fn task(deps: Deps, env: Env, id: TaskId) -> Result<TaskResponse, ContractError> {
-        let task = TASKS.load(deps.storage, id)?;
-        let status = task.validate_status(&env);
-
-        let r = TaskResponse {
-            id,
-            description: task.description,
-            status,
-            payload: task.payload,
-            result: task.result,
-        };
-        Ok(r)
-    }
-
-    pub fn task_status(
-        deps: Deps,
-        env: Env,
-        id: TaskId,
-    ) -> Result<TaskStatusResponse, ContractError> {
-        let task = TASKS.load(deps.storage, id)?;
-        let status = task.validate_status(&env).into();
-
-        let r = TaskStatusResponse {
-            id,
-            status,
-            created_height: task.timing.created_height,
-            created_time: task.timing.created_at,
-            expires_time: task.timing.expires_at,
-        };
-        Ok(r)
-    }
-
-    pub fn config(deps: Deps, _env: Env) -> Result<ConfigResponse, ContractError> {
-        let config = CONFIG.load(deps.storage)?;
-        let r = ConfigResponse {
-            requestor: config.requestor.into(),
-            timeout: config.timeout,
-            verifier: config.verifier.into_string(),
-        };
-        Ok(r)
-    }
-
-    // TODO: There should probably be a max page limit, but it's left unbound to keep the API simple for now
     pub fn list_open(
         deps: Deps,
         env: Env,
         start_after: Option<TaskId>,
         limit: Option<u32>,
     ) -> Result<ListOpenResponse, ContractError> {
-        let limit = limit.map(|v| v as usize).unwrap_or(usize::MAX);
-
-        let open = TASKS
-            .idx
-            .status
-            .prefix(Status::Open {}.as_str())
-            .range(
-                deps.storage,
-                None,
-                start_after.map(Bound::exclusive),
-                cosmwasm_std::Order::Descending,
-            )
-            .filter_map(|r| match r {
-                Ok((
-                    id,
-                    Task {
-                        payload,
-                        status: Status::Open {},
-                        timing,
-                        ..
-                    },
-                )) if timing.expires_at > env.block.time.seconds() => Some(Ok(OpenTaskOverview {
-                    id,
-                    expires: timing.expires_at,
-                    payload,
-                })),
-                Ok(_) => None,
-                Err(e) => Some(Err(e)),
+        let limit = limit.unwrap_or(10) as usize;
+        let tasks: StdResult<Vec<TaskMetadata>> = TASKS
+            .range(deps.storage, None, None, Order::Ascending)
+            .filter(|item| {
+                if let Ok((_, task)) = item {
+                    matches!(task.status, Status::Open {})
+                } else {
+                    false
+                }
+            })
+            .skip_while(|item| {
+                if let Ok((id, _)) = item {
+                    if let Some(start_id) = &start_after {
+                        return &id.0 <= &start_id.0;
+                    }
+                }
+                false
             })
             .take(limit)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|item| {
+                item.map(|(id, task)| TaskMetadata {
+                    id,
+                    description: task.description,
+                    status: task.status,
+                    timing: task.timing,
+                    payload: task.payload.clone(),
+                    result: task.result.clone(),
+                })
+            })
+            .collect();
 
-        Ok(ListOpenResponse { tasks: open })
+        Ok(ListOpenResponse { tasks: tasks? })
     }
 
-    pub fn list_completed(
+    pub fn task_info(
         deps: Deps,
-        _env: Env,
-        start_after: Option<TaskId>,
-        limit: Option<u32>,
-    ) -> Result<ListCompletedResponse, ContractError> {
-        let limit = limit.map(|v| v as usize).unwrap_or(usize::MAX);
+        env: Env,
+        task_id: TaskId,
+    ) -> Result<TaskMetadata, ContractError> {
+        let task = TASKS.may_load(deps.storage, task_id.clone())?.ok_or(ContractError::TaskNotFound)?;
 
-        let completed = TASKS
-            .idx
-            .status
-            .prefix(Status::Completed { completed: 0 }.as_str())
-            .range(
-                deps.storage,
-                None,
-                start_after.map(Bound::exclusive),
-                cosmwasm_std::Order::Descending,
-            )
-            .filter_map(|r| match r {
-                Ok((
-                    id,
-                    Task {
-                        result,
-                        status: Status::Completed { completed, .. },
-                        ..
-                    },
-                )) => match result {
-                    None => Some(Err(ContractError::MissingResultCompleted { id })),
-                    Some(result) => Some(Ok(CompletedTaskOverview {
-                        id,
-                        completed,
-                        result,
-                    })),
-                },
-                Ok(_) => None,
-                Err(e) => Some(Err(e.into())),
-            })
-            .take(limit)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ListCompletedResponse { tasks: completed })
+        Ok(TaskMetadata {
+            id: task_id,
+            description: task.description,
+            status: task.status,
+            timing: task.timing,
+            payload: task.payload,
+            result: task.result,
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+    use cosmwasm_std::{Addr, from_binary, coins, Uint128};
+    use lavs_apis::id::TaskId;
+    use lavs_apis::tasks::{ResponseType, RequestType};
+
+    #[test]
+    fn test_instantiate_task_queue() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("creator", &coins(1000, "earth"));
+        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(res.attributes.len(), 1);
+        assert_eq!(res.attributes[0].value, "instantiate");
+    }
+
+    #[test]
+    fn test_create_task() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        let res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        assert_eq!(res.attributes.len(), 1);
+        assert_eq!(res.attributes[0].value, "instantiate");
+       
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(7200),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        let res = execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+        assert_eq!(res.attributes.len(), 2);
+        assert_eq!(res.attributes[0].value, "create_task");
+        assert_eq!(res.attributes[1].value, "task_id");
+
+        // Verify task creation
+        let task_id = TaskId::new(1);
+        let query_msg = QueryMsg::TaskInfo { task_id: task_id.clone() };
+        let res = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let task: TaskMetadata = from_binary(&res).unwrap();
+        assert_eq!(task.id, task_id);
+        assert_eq!(task.description, "Will Team A win?".to_string());
+        assert!(matches!(task.status, Status::Open {}));
+    }
+
+    #[test]
+    fn test_complete_task_success() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        // Create a task
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(7200),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+
+        // Complete the task as Oracle Verifier
+        let complete_msg = ExecuteMsg::CompleteTask {
+            task_id: TaskId::new(1),
+            result: ResponseType::Json("{\"winner\":\"Team A\"}".to_string()),
+        };
+        let verifier_info = mock_info("verifier", &[]);
+        let res = execute(deps.as_mut(), mock_env(), verifier_info, complete_msg).unwrap();
+        assert_eq!(res.attributes.len(), 3);
+        assert_eq!(res.attributes[0].value, "complete_task");
+        assert_eq!(res.attributes[1].value, "task_id");
+        assert_eq!(res.attributes[2].value, "verified");
+
+        // Verify task completion
+        let query_msg = QueryMsg::TaskInfo { task_id: TaskId::new(1) };
+        let res = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let task: TaskMetadata = from_binary(&res).unwrap();
+        assert!(matches!(task.status, Status::Completed { .. }));
+        assert_eq!(task.result.unwrap(), ResponseType::Json("{\"winner\":\"Team A\"}".to_string()));
+    }
+
+    #[test]
+    fn test_complete_task_unauthorized() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        // Create a task
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(7200),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+
+        // Attempt to complete the task as an unauthorized user
+        let complete_msg = ExecuteMsg::CompleteTask {
+            task_id: TaskId::new(1),
+            result: ResponseType::Json("{\"winner\":\"Team A\"}".to_string()),
+        };
+        let unauthorized_info = mock_info("intruder", &[]);
+        let err = execute(deps.as_mut(), mock_env(), unauthorized_info, complete_msg).unwrap_err();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    #[test]
+    fn test_expire_task_success() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 1, // 1 second for testing
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        // Create a task with a short timeout
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(1),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+
+        // Fast-forward time to trigger expiration
+        let mut env = mock_env();
+        env.block.time = env.block.time.plus_seconds(2);
+        env.block.height += 2;
+
+        // Expire the task
+        let expire_msg = ExecuteMsg::ExpireTask {
+            task_id: TaskId::new(1),
+        };
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), expire_msg).unwrap();
+        assert_eq!(res.attributes.len(), 2);
+        assert_eq!(res.attributes[0].value, "expire_task");
+        assert_eq!(res.attributes[1].value, "task_id");
+
+        // Verify task expiration
+        let query_msg = QueryMsg::TaskInfo { task_id: TaskId::new(1) };
+        let res = query(deps.as_ref(), env, query_msg).unwrap();
+        let task: TaskMetadata = from_binary(&res).unwrap();
+        assert!(matches!(task.status, Status::Expired {}));
+    }
+
+    #[test]
+    fn test_expire_task_unauthorized() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        // Create a task
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(7200),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+
+        // Attempt to expire the task as an unauthorized user
+        let expire_msg = ExecuteMsg::ExpireTask {
+            task_id: TaskId::new(1),
+        };
+        let unauthorized_info = mock_info("intruder", &[]);
+        let err = execute(deps.as_mut(), mock_env(), unauthorized_info, expire_msg).unwrap_err();
+        assert_eq!(err, ContractError::Unauthorized);
+    }
+
+    #[test]
+    fn test_complete_task_already_completed() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            requestor: "requestor".to_string(),
+            verifier: "verifier".to_string(),
+            timeout: 3600,
+        };
+        let info = mock_info("requestor", &coins(1000, "earth"));
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        // Create a task
+        let create_msg = ExecuteMsg::Create {
+            description: "Will Team A win?".to_string(),
+            timeout: Some(7200),
+            payload: RequestType::Json("{\"event\":\"Team A vs Team B\"}".to_string()),
+            options: vec!["Team A".to_string(), "Team B".to_string()],
+            proposed_winner: "Team A".to_string(),
+        };
+        execute(deps.as_mut(), mock_env(), info.clone(), create_msg).unwrap();
+
+        // Complete the task as Oracle Verifier
+        let complete_msg = ExecuteMsg::CompleteTask {
+            task_id: TaskId::new(1),
+            result: ResponseType::Json("{\"winner\":\"Team A\"}".to_string()),
+        };
+        let verifier_info = mock_info("verifier", &[]);
+        execute(deps.as_mut(), mock_env(), verifier_info.clone(), complete_msg).unwrap();
+
+        // Attempt to complete the same task again
+        let complete_again_msg = ExecuteMsg::CompleteTask {
+            task_id: TaskId::new(1),
+            result: ResponseType::Json("{\"winner\":\"Team B\"}".to_string()),
+        };
+        let res = execute(deps.as_mut(), mock_env(), verifier_info, complete_again_msg);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), ContractError::TaskCompleted);
+    }
+}

@@ -1,7 +1,9 @@
-use cosmwasm_std::{Decimal, StdError};
+use cosmwasm_std::StdError;
+use cosmwasm_std::Decimal;
 use cw_utils::PaymentError;
 use lavs_helpers::verifier::VerifierError;
 use thiserror::Error;
+
 #[derive(Error, Debug)]
 pub enum ContractError {
     #[error("{0}")]
@@ -16,10 +18,7 @@ pub enum ContractError {
     #[error("Unauthorized")]
     Unauthorized,
 
-    #[error("Invalid percentage {1} for value {0}, must be between and 0.1 and 100")]
-    InvalidPercentage(String, Decimal),
-
-    #[error("Thresshold not met")]
+    #[error("Threshold not met")]
     ThresholdNotMet,
 
     #[error("Zero price submitted")]
@@ -42,4 +41,13 @@ pub enum ContractError {
 
     #[error("Invalid price provided")]
     InvalidPrice,
+
+    #[error("Failed to submit vote to Mock Operators")]
+    SubmitVoteError,
+
+    #[error("Vote Processing Failed")]
+    VoteProcessingFailed,
+
+    #[error("Slashing Failed")]
+    SlashingFailed,
 }
