@@ -1,11 +1,35 @@
-# AVS Oracle Example
+# Prediction Market AVS 
+Introduction:
+As a part of the Infinite Hacker at Devcon Bangkok our team of 4 Blockchain at Berkeley members hacked from Nov 11 - Nov 15. This research document details our overarching idea, our progress, and our experience working with Layer and Eigenlayer.
 
-This is a simple, yet realistic, example of an AVS built on Layer, which shows the power of WASI
-to do something beyond simple squaring (which can be done in a contract).
 
-It also provides an example how you can customize and use the WASI APIs
-to make HTTP requests and access files in your component. It also provides and example of
-how to customize the verifier contract when you want do have a more complex "reduce function"
-than exact matches above a threshold.
+# Intended WorkFlow
 
-# prediction-market-avs
+ sequenceDiagram
+    participant Event_Source
+    participant AVS_Contract
+    participant Operator
+
+    Event_Source ->> AVS_Contract: Emit NewTaskCreated event
+    AVS_Contract ->> AVS_Contract: Add task to queue
+    loop For each task in the queue
+        AVS_Contract ->> AVS_Contract: Process next task
+        loop For each registered and staked Operator
+            AVS_Contract -->> Operator: Notify of NewTaskCreated event
+            Operator ->> Operator: Observe off-chain event
+            Operator ->> Operator: Generate result, hash it, and sign the hash
+            Operator ->> AVS_Contract: Submit signed hash
+            AVS_Contract ->> AVS_Contract: Verify Operator's registration and stake
+            AVS_Contract ->> Operator: Accept submission if valid
+        end
+        AVS_Contract ->> AVS_Contract: Tally votes with weightage
+        alt Majority consensus achieved
+            AVS_Contract ->> AVS_Contract: Determine truth based on majority
+            AVS_Contract ->> Operator: Slash operators with minority votes
+        else No consensus
+            AVS_Contract ->> AVS_Contract: Mark task as unresolved
+        end
+        AVS_Contract ->> AVS_Contract: Remove task from queue
+    end
+
+
