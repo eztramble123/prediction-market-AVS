@@ -1,0 +1,3 @@
+[submodule "frontend/avs-frontend-2"]
+	path = frontend/avs-frontend-2
+	url = https://github.com/smagazi/avs-frontend-2.git
